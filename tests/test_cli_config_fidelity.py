@@ -54,6 +54,28 @@ def _function_scheduler_config_kwargs(source_path: Path, func_name: str) -> set[
     )
 
 
+def _function_load_model_kwargs(source_path: Path, func_name: str) -> set[str]:
+    """Return kwargs passed to load_model() inside the named function."""
+    tree = ast.parse(source_path.read_text())
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name == func_name):
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            func = call.func
+            name = (
+                func.id
+                if isinstance(func, ast.Name)
+                else (func.attr if isinstance(func, ast.Attribute) else None)
+            )
+            if name == "load_model":
+                return {kw.arg for kw in call.keywords if kw.arg}
+    raise AssertionError(
+        f"function {func_name} or its load_model(...) call not found in {source_path}"
+    )
+
+
 def test_prefill_step_size_is_plumbed_in_serve_command():
     """#400 regression — serve_command must pass --prefill-step-size to SchedulerConfig.
 
@@ -68,6 +90,17 @@ def test_prefill_step_size_is_plumbed_in_serve_command():
         "regression: SchedulerConfig in serve_command no longer receives "
         "prefill_step_size — see #400. Add `prefill_step_size=args.prefill_step_size` "
         "to the SchedulerConfig(...) construction."
+    )
+
+
+def test_serve_command_forwards_continuous_batching_choice():
+    """The CLI default is SimpleEngine; --continuous-batching must be
+    forwarded explicitly so BatchedEngine remains selectable.
+    """
+    kwargs = _function_load_model_kwargs(CLI_SOURCE, "serve_command")
+    assert "use_batching" in kwargs, (
+        "regression: serve_command must forward use_batching=args.continuous_batching "
+        "to server.load_model so --continuous-batching selects BatchedEngine."
     )
 
 
@@ -190,7 +223,11 @@ def test_load_model_prefill_step_size_back_compat_translation():
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             try:
-                server.load_model("dummy-model", prefill_step_size=9999)
+                server.load_model(
+                    "dummy-model",
+                    prefill_step_size=9999,
+                    use_batching=True,
+                )
             except RuntimeError as exc:
                 assert "stop after translation" in str(exc)
 

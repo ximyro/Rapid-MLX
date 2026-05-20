@@ -24,7 +24,7 @@ import pytest
 
 
 class _StubEngine:
-    """Minimal stand-in for `BatchedEngine` — only the surface `load_model`
+    """Minimal stand-in for engine classes — only the surface `load_model`
     actually accesses between construction and the model-registry add.
 
     This is intentionally explicit (not `MagicMock`) so that any future
@@ -66,7 +66,7 @@ def test_load_model_enables_native_tool_format_when_parser_supports_it(monkeypat
     """
     from vllm_mlx import server
 
-    monkeypatch.setattr(server, "BatchedEngine", _StubEngine)
+    monkeypatch.setattr(server, "SimpleEngine", _StubEngine)
     monkeypatch.setattr(server, "_engine", None, raising=False)
     monkeypatch.setattr(server, "_enable_auto_tool_choice", True, raising=False)
     monkeypatch.setattr(server, "_tool_call_parser", "hermes", raising=False)
@@ -84,6 +84,30 @@ def test_load_model_enables_native_tool_format_when_parser_supports_it(monkeypat
     # ordering fix, detection sees the synced cfg and propagates that
     # to the engine.
     assert server._engine.preserve_native_tool_format is True
+
+
+def test_load_model_uses_batched_engine_when_requested(monkeypatch):
+    """SimpleEngine is the default again, but use_batching=True must still
+    route to BatchedEngine for multi-user continuous batching.
+    """
+    from vllm_mlx import server
+
+    monkeypatch.setattr(server, "BatchedEngine", _StubEngine)
+    monkeypatch.setattr(server, "_engine", None, raising=False)
+    monkeypatch.setattr(server, "_enable_auto_tool_choice", False, raising=False)
+    monkeypatch.setattr(server, "_tool_call_parser", None, raising=False)
+    monkeypatch.setattr(server, "_reasoning_parser_name", None, raising=False)
+    monkeypatch.setattr(server, "_reasoning_parser", None, raising=False)
+    monkeypatch.setattr(server, "_tool_parser_instance", None, raising=False)
+    monkeypatch.setattr(server, "_mcp_manager", None, raising=False)
+    monkeypatch.setattr(server, "_enable_tool_logits_bias", False, raising=False)
+    monkeypatch.setattr(server, "_model_alias", None, raising=False)
+
+    server.load_model("mlx-community/Qwen3.5-9B-4bit", use_batching=True)
+
+    assert isinstance(server._engine, _StubEngine)
+    assert server._engine.kwargs["model_name"] == "mlx-community/Qwen3.5-9B-4bit"
+    assert "scheduler_config" in server._engine.kwargs
 
 
 def test_detect_native_tool_support_requires_synced_config(monkeypatch):
