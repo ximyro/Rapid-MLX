@@ -2,18 +2,55 @@
 """
 Engine abstraction for vllm-mlx inference.
 
-BatchedEngine is the sole engine — continuous batching for all workloads.
+Provides two engine implementations:
+- SimpleEngine: Direct model calls for maximum single-user throughput
+- BatchedEngine: Continuous batching for multiple concurrent users
+
+The package stays intentionally light at import time so server- and
+contract-level tests can import API modules without eagerly importing MLX,
+engine_core, or the batched engine stack.
 """
 
-from ..engine_core import AsyncEngineCore, EngineConfig, EngineCore
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from .base import BaseEngine, GenerationOutput
-from .batched import BatchedEngine
+
+if TYPE_CHECKING:
+    from ..engine_core import AsyncEngineCore, EngineConfig, EngineCore
+    from .batched import BatchedEngine
+    from .simple import SimpleEngine
 
 __all__ = [
     "BaseEngine",
     "GenerationOutput",
+    "SimpleEngine",
     "BatchedEngine",
     "EngineCore",
     "AsyncEngineCore",
     "EngineConfig",
 ]
+
+
+def __getattr__(name: str):
+    if name == "SimpleEngine":
+        from .simple import SimpleEngine
+
+        return SimpleEngine
+
+    if name == "BatchedEngine":
+        from .batched import BatchedEngine
+
+        return BatchedEngine
+
+    if name in {"EngineCore", "AsyncEngineCore", "EngineConfig"}:
+        from ..engine_core import AsyncEngineCore, EngineConfig, EngineCore
+
+        return {
+            "EngineCore": EngineCore,
+            "AsyncEngineCore": AsyncEngineCore,
+            "EngineConfig": EngineConfig,
+        }[name]
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

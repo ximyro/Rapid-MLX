@@ -100,7 +100,7 @@ from .api.utils import (
 from .config import get_config
 from .engine import (
     BaseEngine,
-    BatchedEngine,
+    SimpleEngine,
 )
 from .runtime.model_registry import ModelEntry, ModelRegistry
 from .service.helpers import (  # noqa: F401 — re-export for backward compat
@@ -133,6 +133,10 @@ from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Loaded lazily inside load_model(use_batching=True) so importing server.py does
+# not initialize MLX/BatchedEngine in contract tests or headless environments.
+BatchedEngine = None
 
 
 def normalize_log_level(log_level: str) -> str:
@@ -506,6 +510,7 @@ def load_model(
     served_model_name: str | None = None,
     mtp: bool = False,
     *,
+    use_batching: bool = False,
     force_text: bool = False,
     force_hybrid: bool = False,
     no_hybrid: bool = False,
@@ -530,6 +535,8 @@ def load_model(
             into ``scheduler_config.prefill_step_size`` and a DeprecationWarning
             is emitted. Will be removed in a future release.
         mtp: Enable native MTP speculative decoding
+        use_batching: Use BatchedEngine continuous batching. Defaults to False
+            so local development uses SimpleEngine for lower single-user overhead.
         force_text: Keyword-only. Force loading as text-only LLM even when
             auto-detection would route as MLLM. Escape hatch for incomplete
             vision-tower checkpoints (#393) and text-only forks of multimodal
@@ -626,6 +633,13 @@ def load_model(
             "force_spec_decode and no_spec_decode are mutually exclusive — "
             "pick at most one to override auto-detection."
         )
+    if not use_batching and (
+        force_hybrid or no_hybrid or force_spec_decode or no_spec_decode
+    ):
+        raise ValueError(
+            "force_hybrid/no_hybrid/force_spec_decode/no_spec_decode require "
+            "use_batching=True (--continuous-batching)."
+        )
     if force_mllm:
         logger.info("Force MLLM mode enabled via --mllm flag")
     if force_text:
@@ -634,19 +648,37 @@ def load_model(
             "(MLLM auto-detection overridden, #393)"
         )
 
-    logger.info(f"Loading model with BatchedEngine: {model_name}")
-    _engine = BatchedEngine(
-        model_name=model_name,
-        scheduler_config=scheduler_config,
-        stream_interval=stream_interval,
-        force_mllm=force_mllm,
-        force_text=force_text,
-        gpu_memory_utilization=gpu_memory_utilization,
-        force_hybrid=force_hybrid,
-        no_hybrid=no_hybrid,
-        force_spec_decode=force_spec_decode,
-        no_spec_decode=no_spec_decode,
-    )
+    if use_batching:
+        batched_engine_cls = BatchedEngine
+        if batched_engine_cls is None:
+            from .engine.batched import BatchedEngine as batched_engine_cls
+
+        logger.info(f"Loading model with BatchedEngine: {model_name}")
+        _engine = batched_engine_cls(
+            model_name=model_name,
+            scheduler_config=scheduler_config,
+            stream_interval=stream_interval,
+            force_mllm=force_mllm,
+            force_text=force_text,
+            gpu_memory_utilization=gpu_memory_utilization,
+            force_hybrid=force_hybrid,
+            no_hybrid=no_hybrid,
+            force_spec_decode=force_spec_decode,
+            no_spec_decode=no_spec_decode,
+        )
+    else:
+        logger.info(f"Loading model with SimpleEngine: {model_name}")
+        _engine = SimpleEngine(
+            model_name=model_name,
+            force_mllm=force_mllm,
+            force_text=force_text,
+            mtp=mtp,
+            prefill_step_size=(
+                scheduler_config.prefill_step_size
+                if scheduler_config is not None
+                else 2048
+            ),
+        )
     logger.info(f"Model loaded: {model_name}")
 
     # Sync globals into ServerConfig BEFORE _detect_native_tool_support reads
@@ -949,10 +981,10 @@ Examples:
     parser.add_argument(
         "--continuous-batching",
         action="store_true",
-        default=True,
-        help="Enable continuous batching (default: on).",
+        default=False,
+        help="Enable BatchedEngine continuous batching (default: off).",
     )
-    # Deprecated flags — accepted silently to avoid breaking user scripts
+    # Compatibility flag; SimpleEngine is now the default.
     import argparse as _ap
 
     parser.add_argument(
@@ -1213,6 +1245,8 @@ Examples:
     scheduler_config = SchedulerConfig(prefill_step_size=args.prefill_step_size)
 
     # Load model before starting server
+    if args.simple_engine and args.continuous_batching:
+        parser.error("--simple-engine and --continuous-batching are mutually exclusive")
     if args.mllm and args.no_mllm:
         parser.error("--mllm and --no-mllm are mutually exclusive")
     if getattr(args, "force_hybrid", False) and getattr(args, "no_hybrid", False):
@@ -1231,6 +1265,7 @@ Examples:
         cloud_threshold=args.cloud_threshold,
         cloud_api_base=args.cloud_api_base,
         cloud_api_key=args.cloud_api_key,
+        use_batching=args.continuous_batching,
         force_hybrid=getattr(args, "force_hybrid", False),
         no_hybrid=getattr(args, "no_hybrid", False),
         force_spec_decode=getattr(args, "force_spec_decode", False),

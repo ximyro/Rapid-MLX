@@ -705,13 +705,54 @@ def serve_command(args):
         server.load_embedding_model(args.embedding_model, lock=True)
         print(f"Embedding model loaded: {args.embedding_model}")
 
-    # Warn about deprecated flags
-    if getattr(args, "simple_engine", False):
+    if getattr(args, "simple_engine", False) and args.continuous_batching:
         print(
-            "\n  ⚠ --simple-engine is deprecated and has no effect."
-            "\n    BatchedEngine is now the sole engine — it handles both"
-            "\n    single-user and multi-user workloads with equal performance.\n"
+            "\n  Error: --simple-engine and --continuous-batching are mutually "
+            "exclusive. SimpleEngine is the default; pass only "
+            "--continuous-batching to use BatchedEngine.\n"
         )
+        sys.exit(1)
+
+    if not args.continuous_batching:
+        batching_only_flags = []
+        if args.suffix_decoding:
+            batching_only_flags.append("--suffix-decoding")
+        if args.use_paged_cache:
+            batching_only_flags.append("--use-paged-cache")
+        if args.kv_cache_quantization:
+            batching_only_flags.append("--kv-cache-quantization")
+        if args.kv_cache_turboquant:
+            batching_only_flags.append("--kv-cache-turboquant")
+        if args.disable_prefix_cache:
+            batching_only_flags.append("--disable-prefix-cache")
+        if args.prefix_cache_size != 100:
+            batching_only_flags.append("--prefix-cache-size")
+        if args.cache_memory_mb is not None:
+            batching_only_flags.append("--cache-memory-mb")
+        if abs(args.cache_memory_percent - 0.20) > 1e-9:
+            batching_only_flags.append("--cache-memory-percent")
+        if args.no_memory_aware_cache:
+            batching_only_flags.append("--no-memory-aware-cache")
+        if args.chunked_prefill_tokens > 0:
+            batching_only_flags.append("--chunked-prefill-tokens")
+        if args.stream_interval != 1:
+            batching_only_flags.append("--stream-interval")
+        if getattr(args, "force_hybrid", False):
+            batching_only_flags.append("--force-hybrid")
+        if getattr(args, "no_hybrid", False):
+            batching_only_flags.append("--no-hybrid")
+        if getattr(args, "force_spec_decode", False):
+            batching_only_flags.append("--force-spec-decode")
+        if getattr(args, "no_spec_decode", False):
+            batching_only_flags.append("--no-spec-decode")
+        if batching_only_flags:
+            print(
+                "\n  Error: the following flags require --continuous-batching: "
+                f"{', '.join(batching_only_flags)}.\n"
+            )
+            sys.exit(1)
+
+    # Warn about deprecated flags
     if getattr(args, "kv_bits", None) is not None:
         print(
             "\n  ⚠ --kv-bits is deprecated and has no effect."
@@ -791,23 +832,31 @@ def serve_command(args):
         kv_cache_turboquant_group_size=args.kv_cache_turboquant_group_size,
     )
 
-    print("Mode: Continuous batching (for multiple concurrent users)")
-    if args.chunked_prefill_tokens > 0:
+    if args.continuous_batching:
+        print("Mode: Continuous batching (for multiple concurrent users)")
+    else:
+        print("Mode: Simple engine (single-user/local development)")
+    if args.continuous_batching and args.chunked_prefill_tokens > 0:
         print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
     if args.enable_mtp:
         print(f"MTP: enabled, draft_tokens={args.mtp_num_draft_tokens}")
-    if args.suffix_decoding:
+    if args.continuous_batching and args.suffix_decoding:
         print(
             f"SuffixDecoding: enabled, max_draft={args.suffix_max_draft}, "
             f"max_suffix={args.suffix_max_suffix_len}, "
             f"min_conf={args.suffix_min_confidence}"
         )
-    print(f"Stream interval: {args.stream_interval} tokens")
-    if args.use_paged_cache:
+    if args.continuous_batching:
+        print(f"Stream interval: {args.stream_interval} tokens")
+    if args.continuous_batching and args.use_paged_cache:
         print(
             f"Paged cache: block_size={args.paged_cache_block_size}, max_blocks={args.max_cache_blocks}"
         )
-    elif enable_prefix_cache and not args.no_memory_aware_cache:
+    elif (
+        args.continuous_batching
+        and enable_prefix_cache
+        and not args.no_memory_aware_cache
+    ):
         cache_info = (
             f"{args.cache_memory_mb}MB"
             if args.cache_memory_mb
@@ -829,7 +878,7 @@ def serve_command(args):
                 f"KV cache quantization: {args.kv_cache_quantization_bits}-bit, "
                 f"group_size={args.kv_cache_quantization_group_size}"
             )
-    elif enable_prefix_cache:
+    elif args.continuous_batching and enable_prefix_cache:
         print(f"Prefix cache: max_entries={args.prefix_cache_size}")
 
     # Check port availability before loading model (avoid wasting RAM on conflict).
@@ -936,6 +985,7 @@ def serve_command(args):
             cloud_api_key=args.cloud_api_key,
             served_model_name=args.served_model_name,
             mtp=args.enable_mtp,
+            use_batching=args.continuous_batching,
             force_hybrid=getattr(args, "force_hybrid", False),
             no_hybrid=getattr(args, "no_hybrid", False),
             force_spec_decode=getattr(args, "force_spec_decode", False),
@@ -2921,10 +2971,10 @@ Examples:
     serve_parser.add_argument(
         "--continuous-batching",
         action="store_true",
-        default=True,
-        help="Enable continuous batching (default: on).",
+        default=False,
+        help="Enable BatchedEngine continuous batching (default: off).",
     )
-    # Deprecated flags — accepted silently to avoid breaking user scripts
+    # Compatibility flag; SimpleEngine is now the default.
     serve_parser.add_argument(
         "--simple-engine",
         action="store_true",
