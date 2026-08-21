@@ -830,3 +830,183 @@ def test_clean_output_text_extracts_muse_channels():
         clean_output_text(prose2, muse_wire=True)
         == "Historically assistant marked a header."
     )
+
+
+# ---------------------------------------------------------------------------
+# Namespaced tool-name normalization (glob.glob -> glob)
+# ---------------------------------------------------------------------------
+
+
+def test_namespaced_name_maps_to_registered_tool():
+    # The chat template advertises tools under dot-namespaces, so the
+    # model emits ``glob.glob`` for a client tool registered as ``glob``.
+    # Normalization must also pick up the registered tool's schema.
+    parser = _tool_parser()
+    text = _block(_invoke("glob.glob", {"pattern": "*.py", "limit": "5"}))
+    request = _request("glob", {"pattern": {"type": "string"}, "limit": {"type": "integer"}})
+    result = parser.extract_tool_calls(text, request=request)
+    assert result.tool_calls[0]["name"] == "glob"
+    assert json.loads(result.tool_calls[0]["arguments"]) == {"pattern": "*.py", "limit": 5}
+
+
+def test_registered_dotted_name_passes_through():
+    parser = _tool_parser()
+    text = _block(_invoke("fs.read", {"path": "/a"}))
+    result = parser.extract_tool_calls(
+        text, request=_request("fs.read", {"path": {"type": "string"}})
+    )
+    assert result.tool_calls[0]["name"] == "fs.read"
+
+
+def test_unknown_dotted_name_without_match_is_untouched():
+    # Neither ``ns.fn`` nor ``fn`` registered: never guess.
+    parser = _tool_parser()
+    text = _block(_invoke("a.b", {"x": "1"}))
+    result = parser.extract_tool_calls(
+        text, request=_request("other", {"x": {"type": "string"}})
+    )
+    assert result.tool_calls[0]["name"] == "a.b"
+
+
+def test_dotted_name_with_no_tools_is_untouched():
+    parser = _tool_parser()
+    text = _block(_invoke("glob.glob", {"pattern": "*.py"}))
+    result = parser.extract_tool_calls(text, request=None)
+    assert result.tool_calls[0]["name"] == "glob.glob"
+
+
+# ---------------------------------------------------------------------------
+# Bare-value recovery: <atem:invoke name="tool.param">VALUE</atem:parameter>
+# ---------------------------------------------------------------------------
+
+
+@BOTH_MODES
+def test_conflated_param_in_invoke_name_recovers(streaming):
+    # Exact shape observed from Muse-Glimmer-30B-4bit: parameter merged
+    # into the invoke tag, param opener dropped, param closer kept.
+    text = (
+        "<atem:function_calls>\n"
+        '<atem:invoke name="skill.name">karpathy-guidelines</atem:parameter>\n'
+        "</atem:invoke>\n"
+        "</atem:function_calls>"
+    )
+    _, calls = run_tool_extraction(_tool_parser(), _chars(text), streaming=streaming)
+    assert [(c.name, json.loads(c.arguments)) for c in calls] == [
+        ("skill.name", {"name": "karpathy-guidelines"})
+    ]
+
+
+def test_conflated_name_normalizes_to_registered_prefix_tool():
+    parser = _tool_parser()
+    text = (
+        "<atem:function_calls>\n"
+        '<atem:invoke name="skill.name">go-developer</atem:parameter>\n'
+        "</atem:invoke>\n"
+        "</atem:function_calls>"
+    )
+    request = _request("skill", {"name": {"type": "string"}})
+    result = parser.extract_tool_calls(text, request=request)
+    assert result.tool_calls[0]["name"] == "skill"
+    assert json.loads(result.tool_calls[0]["arguments"]) == {"name": "go-developer"}
+
+
+def test_two_conflated_blocks_both_recover():
+    parser = _tool_parser()
+    block = (
+        "<atem:function_calls>\n"
+        '<atem:invoke name="skill.name">%s</atem:parameter>\n'
+        "</atem:invoke>\n"
+        "</atem:function_calls>"
+    )
+    result = parser.extract_tool_calls(
+        block % "karpathy-guidelines" + block % "go-developer",
+        request=_request("skill", {"name": {"type": "string"}}),
+    )
+    assert [
+        (c["name"], json.loads(c["arguments"])["name"]) for c in result.tool_calls
+    ] == [("skill", "karpathy-guidelines"), ("skill", "go-developer")]
+
+
+def test_bare_value_without_dot_stays_content():
+    # No dot in the name: the parameter name cannot be inferred, so the
+    # block must stay visible content — never a guessed call.
+    parser = _tool_parser()
+    text = (
+        "<atem:function_calls>\n"
+        '<atem:invoke name="skill">karpathy-guidelines</atem:parameter>\n'
+        "</atem:invoke>\n"
+        "</atem:function_calls>"
+    )
+    result = parser.extract_tool_calls(text)
+    assert result.tool_calls == []
+    assert "karpathy-guidelines" in (result.content or "")
+
+
+def test_bare_value_with_literal_param_closer_inside():
+    # A literal </atem:parameter> mid-value only closes at the boundary-
+    # valid occurrence (the one followed by the invoke closer).
+    parser = _tool_parser()
+    text = (
+        "<atem:function_calls>\n"
+        '<atem:invoke name="echo.text">a</atem:parameter>b</atem:parameter>\n'
+        "</atem:invoke>\n"
+        "</atem:function_calls>"
+    )
+    result = parser.extract_tool_calls(text)
+    assert json.loads(result.tool_calls[0]["arguments"]) == {
+        "text": "a</atem:parameter>b"
+    }
+
+
+def test_unclosed_bare_value_stays_content_at_flush():
+    # Recovery that never completes must degrade to visible content,
+    # exactly like any other truncated block.
+    parser = _tool_parser()
+    text = '<atem:function_calls>\n<atem:invoke name="skill.name">karpathy'
+    result = parser.extract_tool_calls(text)
+    assert result.tool_calls == []
+    assert "karpathy" in (result.content or "")
+
+
+@BOTH_MODES
+def test_conflated_first_param_followed_by_canonical_param(streaming):
+    # Observed shape: first parameter conflated into the invoke tag,
+    # second parameter emitted canonically. The canonical parameter must
+    # parse as itself — never be swallowed into the bare value.
+    text = (
+        "<atem:function_calls>\n"
+        '<atem:invoke name="bash.command">ls -la</atem:parameter>\n'
+        '<atem:parameter name="workdir">/Users/iliailia/Code/Go/wheely-app-price-go</atem:parameter>\n'
+        "</atem:invoke>\n"
+        "</atem:function_calls>"
+    )
+    _, calls = run_tool_extraction(_tool_parser(), _chars(text), streaming=streaming)
+    assert [(c.name, json.loads(c.arguments)) for c in calls] == [
+        (
+            "bash.command",
+            {
+                "command": "ls -la",
+                "workdir": "/Users/iliailia/Code/Go/wheely-app-price-go",
+            },
+        )
+    ]
+
+
+def test_conflated_first_param_normalizes_and_types_via_schema():
+    parser = _tool_parser()
+    text = (
+        "<atem:function_calls>\n"
+        '<atem:invoke name="bash.command">ls -la</atem:parameter>\n'
+        '<atem:parameter name="timeout">30</atem:parameter>\n'
+        "</atem:invoke>\n"
+        "</atem:function_calls>"
+    )
+    request = _request(
+        "bash", {"command": {"type": "string"}, "timeout": {"type": "integer"}}
+    )
+    result = parser.extract_tool_calls(text, request=request)
+    assert result.tool_calls[0]["name"] == "bash"
+    assert json.loads(result.tool_calls[0]["arguments"]) == {
+        "command": "ls -la",
+        "timeout": 30,
+    }
