@@ -189,6 +189,43 @@ def _walk_invoke(
             tail, _PARAM_OPEN_LITERAL
         ):
             return _INCOMPLETE
+        # Bare-value recovery for dotted-name conflation: quantized Muse
+        # builds systematically merge the FIRST parameter into the invoke
+        # tag —
+        #   <atem:invoke name="bash.command">ls -la</atem:parameter>
+        #   <atem:parameter name="workdir">/x</atem:parameter>
+        #   </atem:invoke>
+        # (parameter opener dropped, its closer kept; further parameters
+        # may follow in canonical form). Recover ONLY that shape: dotted
+        # invoke name, no parameters captured yet. The bare value is
+        # scanned with the SAME boundary rule as a normal parameter value
+        # (closer followed by the next param opener, the invoke closer,
+        # or end of input), the name's dot-suffix becomes the parameter
+        # name, and the walk then resumes the normal grammar loop so
+        # trailing canonical parameters parse as themselves. The
+        # composite name is mapped back to the registered tool later by
+        # ``_normalize_tool_name``. Any other divergence stays malformed
+        # and visible, same as before.
+        name = opener.group("name")
+        if "." in name and not params:
+            value_start = opener.end()
+            pos = value_start
+            while True:
+                idx = text.find(_PARAM_CLOSE, pos)
+                if idx < 0:
+                    return _INCOMPLETE
+                after = idx + len(_PARAM_CLOSE)
+                k = _WS_RE.match(text, after).end()
+                if (
+                    k >= len(text)
+                    or _PARAM_OPEN_RE.match(text, k) is not None
+                    or text.startswith(_INVOKE_CLOSE, k)
+                ):
+                    params.append((name.rsplit(".", 1)[-1], text[value_start:idx]))
+                    cursor = after
+                    break
+                pos = after
+            continue
         return _MALFORMED
 
 
@@ -294,6 +331,41 @@ def _declared_type(cfg: Any) -> str | None:
             if len(types) == 1:
                 return next(iter(types))
     return None
+
+
+def _registered_tool_names(request: dict[str, Any] | None) -> set[str]:
+    """Tool names declared in the request, or empty set."""
+    names: set[str] = set()
+    if isinstance(request, dict):
+        for tool in request.get("tools") or []:
+            fn = tool.get("function") if isinstance(tool, dict) else None
+            if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+                names.add(fn["name"])
+    return names
+
+
+def _normalize_tool_name(name: str, request: dict[str, Any] | None) -> str:
+    """Map a namespaced emitted name back to the registered tool.
+
+    The Muse chat template advertises every tool under a dot-namespace
+    (``render_tool_defs`` splits names on ``.`` and lists the namespaces
+    as tool metadata), so the model may emit ``glob.glob`` for a client
+    tool registered as ``glob``. Only rewrites when the emitted name is
+    NOT registered and the bare suffix IS — a genuinely dotted registered
+    tool name always passes through verbatim.
+    """
+    if "." not in name:
+        return name
+    known = _registered_tool_names(request)
+    if not known or name in known:
+        return name
+    bare = name.rsplit(".", 1)[-1]
+    if bare in known:
+        return bare
+    # ``tool.param`` conflation (see the bare-value recovery in
+    # ``_walk_invoke``): the prefix is the registered tool.
+    prefix = name.split(".", 1)[0]
+    return prefix if prefix in known else name
 
 
 def _schema_properties(tool_name: str, request: dict[str, Any] | None) -> dict:
@@ -418,6 +490,7 @@ class MuseToolParser(ToolParser):
         """
         calls: list[dict[str, str]] = []
         for name, params in invokes:
+            name = _normalize_tool_name(name, request)
             props = _schema_properties(name, request)
             declared = declared_parameter_names(name, request)
             arguments: dict[str, Any] = {}

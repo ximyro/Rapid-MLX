@@ -1834,6 +1834,13 @@ class MemoryAwarePrefixCache:
         self._last_save_outcome: str = "empty"
         self._last_load_bytes: int = 0
 
+        # --pin-system-prompt: exact token keys whose entry (once stored)
+        # must be marked ``protected``. The pin request usually arrives
+        # BEFORE the entry exists — the system-prompt boundary snapshot is
+        # only stored after that request's prefill — so ``pin_prefix``
+        # parks the key here and ``store()`` applies it on insert.
+        self._pending_pins: set[tuple[int, ...]] = set()
+
         # Guards _entries / _sorted_keys mutations against concurrent
         # fetch/store/evict from multiple threads (asyncio loop + mlx-step).
         self._lock = threading.Lock()
@@ -2217,6 +2224,7 @@ class MemoryAwarePrefixCache:
                     existing = self._entries[tokens_key]
                     existing.message_boundary = True
                     existing.message_boundary_sequence = self._message_boundary_sequence
+                self._apply_pending_pin_locked(tokens_key)
                 self._entries.move_to_end(tokens_key)
                 return True
 
@@ -2264,6 +2272,7 @@ class MemoryAwarePrefixCache:
                     existing = self._entries[tokens_key]
                     existing.message_boundary = True
                     existing.message_boundary_sequence = self._message_boundary_sequence
+                self._apply_pending_pin_locked(tokens_key)
                 self._entries.move_to_end(tokens_key)
                 return True
 
@@ -2280,7 +2289,11 @@ class MemoryAwarePrefixCache:
                     if klen >= len(tokens_key):
                         continue
                     if tokens_key[:klen] == key:
-                        to_remove.append(key)
+                        # Pinned entries survive prefix-subset eviction —
+                        # the pinned system-prompt prefix must not be
+                        # consumed by the full-prompt entry that extends it.
+                        if not self._entries[key].protected:
+                            to_remove.append(key)
                     elif key[0] != tokens_key[0]:
                         break
                 for key in to_remove:
@@ -2322,6 +2335,7 @@ class MemoryAwarePrefixCache:
                 self._message_boundary_sequence += 1
                 entry.message_boundary_sequence = self._message_boundary_sequence
             self._entries[tokens_key] = entry
+            self._apply_pending_pin_locked(tokens_key)
             self._current_memory += entry.memory_bytes
             bisect.insort(self._sorted_keys, tokens_key)
             self._stats.entry_count = len(self._entries)
@@ -2353,6 +2367,19 @@ class MemoryAwarePrefixCache:
 
         return True
 
+    def _apply_pending_pin_locked(self, tokens_key: tuple[int, ...]) -> None:
+        """Apply a parked ``pin_prefix`` pin to a just-stored/bumped entry.
+
+        Caller must hold ``self._lock`` and guarantee ``tokens_key`` is in
+        ``_entries``.
+        """
+        if self._pending_pins and tokens_key in self._pending_pins:
+            self._pending_pins.discard(tokens_key)
+            self._entries[tokens_key].protected = True
+            logger.info(
+                f"[pin_prefix] pending pin applied at store ({len(tokens_key)} tokens)"
+            )
+
     def _remove_from_sorted(self, key: tuple[int, ...]) -> None:
         """Remove a key from the sorted index using bisect for O(log N)."""
         idx = bisect.bisect_left(self._sorted_keys, key)
@@ -2363,13 +2390,50 @@ class MemoryAwarePrefixCache:
         """Evict the least recently used entry.
 
         Caller must hold ``self._lock``.
+
+        Protected (pinned) entries are skipped and evicted only as a last
+        resort when nothing else is left — both call sites (the store()
+        make-room loop and the scheduler pressure path) rely on every call
+        making progress, so this must never become a silent no-op.
         """
         if not self._entries:
             return
 
-        # Peek the oldest key.
-        tokens_key = next(iter(self._entries))
+        tokens_key = next(
+            (k for k, e in self._entries.items() if not e.protected), None
+        )
+        if tokens_key is None:
+            tokens_key = next(iter(self._entries))
+            logger.warning(
+                "[lru_evict] all %d entries are protected — evicting the "
+                "oldest pinned entry to relieve memory pressure",
+                len(self._entries),
+            )
         self._evict_entry_locked(tokens_key, reason="lru_evict")
+
+    def pin_prefix(self, tokens: list[int]) -> bool:
+        """Protect the entry with exactly these tokens from eviction.
+
+        If no such entry exists yet, the key is remembered and the pin is
+        applied when ``store()`` inserts it — the --pin-system-prompt
+        boundary snapshot lands only after the pinning request's prefill.
+        Pinned entries are excluded from LRU eviction (except as a last
+        resort under memory pressure), from prefix-subset eviction, and
+        from the hybrid non-trimmable retention bound.
+
+        Returns True if an existing entry was protected immediately.
+        """
+        key = tuple(tokens)
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None:
+                entry.protected = True
+                self._pending_pins.discard(key)
+                logger.info(f"[pin_prefix] protected existing entry ({len(key)} tokens)")
+                return True
+            self._pending_pins.add(key)
+            logger.info(f"[pin_prefix] pending pin registered ({len(key)} tokens)")
+            return False
 
     def _evict_entry_locked(self, tokens_key: tuple[int, ...], reason: str) -> None:
         """Evict one entry by key with full index/ledger bookkeeping.

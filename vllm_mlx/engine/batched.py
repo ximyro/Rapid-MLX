@@ -2277,6 +2277,14 @@ class BatchedEngine(BaseEngine):
             if prefix_boundary > 0:
                 kwargs["prefix_boundary"] = prefix_boundary
 
+        # --pin-system-prompt: one request per unique system prompt snapshots
+        # at the system-segment boundary instead, and the cache pins it.
+        pin_boundary = self._maybe_pin_system_boundary(
+            messages, tools, real_prompt=prompt, enable_thinking=enable_thinking
+        )
+        if pin_boundary > 0:
+            kwargs["prefix_boundary"] = pin_boundary
+
         if tools:
             kwargs["has_tools"] = True
         if requires_prompt_integrity:
@@ -2459,6 +2467,116 @@ class BatchedEngine(BaseEngine):
             boundary = min(lcp, next_turn_lcp) if stable_lcp else lcp
             return max(0, boundary - _PREFIX_BOUNDARY_REPLAY_TOKENS)
         except Exception:
+            return 0
+
+    def _maybe_pin_system_boundary(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        real_prompt: str | None = None,
+        enable_thinking: bool | None = None,
+    ) -> int:
+        """--pin-system-prompt for the batched lane.
+
+        Once per unique system prompt: compute the boundary where the
+        rendered system segment (system message + tool schemas folded in by
+        the template) ends inside the real generation prompt, register a
+        pending pin for that token prefix with the scheduler's memory-aware
+        cache, and return the boundary so the caller can override this one
+        request's ``prefix_boundary``. The scheduler then snapshots the KV
+        state at the system boundary and the cache stores it protected —
+        every later conversation sharing the system prompt resumes from it
+        instead of re-prefilling, and eviction never reclaims it.
+
+        The overriding request trades away its own last-user-message
+        boundary snapshot; its full-prompt entry from prompt_cache_save
+        still serves turn-2 extension, so the cost is one snapshot for one
+        request per unique system prompt.
+
+        Returns 0 (no override) when the flag is off, the prompt was
+        already pinned, the model lane has no boundary machinery, or
+        anything about the template render fails.
+        """
+        if not self._needs_prefix_boundary_snapshot():
+            return 0
+        try:
+            from ..config.server_config import get_config
+
+            cfg = get_config()
+        except Exception:
+            return 0
+        if not getattr(cfg, "pin_system_prompt", False):
+            return 0
+        if not messages or messages[0].get("role") != "system":
+            return 0
+        content = messages[0].get("content")
+        if not isinstance(content, str) or not content:
+            return 0
+
+        import hashlib
+
+        prompt_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+        pinned_hashes = getattr(self, "_pinned_system_hashes", None)
+        if pinned_hashes is None:
+            pinned_hashes = self._pinned_system_hashes = set()
+        if prompt_hash in pinned_hashes:
+            return 0
+
+        inner_engine = getattr(self._engine, "engine", None) if self._engine else None
+        scheduler = getattr(inner_engine, "scheduler", None)
+        cache = getattr(scheduler, "memory_aware_cache", None)
+        if cache is None or not hasattr(cache, "pin_prefix"):
+            return 0
+
+        try:
+            template_tools = convert_tools_for_template(tools) if tools else None
+            # LCP against the ACTUAL rendered prompt the caller will send to
+            # generate() — a fresh render here can differ (e.g. the route's
+            # R12-T1F enable_thinking=False injection for tools requests
+            # changes the token stream) and produced boundaries past the end
+            # of the real prompt.
+            if real_prompt is None:
+                real_prompt = self._apply_chat_template(
+                    messages,
+                    template_tools,
+                    enable_thinking=enable_thinking,
+                    add_generation_prompt=True,
+                )
+            # Templates refuse a system-only conversation ("No user query
+            # found"), so render system + a dummy user probe and let the
+            # LCP stop where the probe diverges from the real user turn.
+            # The shared span then also covers the constant user-turn
+            # header tokens, which every future conversation shares too.
+            system_prompt = self._apply_chat_template(
+                [messages[0], {"role": "user", "content": "__rapid_mlx_pin_probe__"}],
+                template_tools,
+                enable_thinking=enable_thinking,
+                add_generation_prompt=False,
+            )
+            tokenizer = self.tokenizer
+            if hasattr(tokenizer, "tokenizer"):
+                tokenizer = tokenizer.tokenizer
+            real_tokens = tokenizer.encode(real_prompt)
+            system_tokens = tokenizer.encode(system_prompt)
+            lcp = 0
+            for real_token, system_token in zip(real_tokens, system_tokens):
+                if real_token != system_token:
+                    break
+                lcp += 1
+            boundary = max(0, lcp - _PREFIX_BOUNDARY_REPLAY_TOKENS)
+            # Too short to be worth a snapshot, or not strictly inside the
+            # prompt (equality produces no inter-segment boundary).
+            if boundary < 16 or boundary >= len(real_tokens):
+                return 0
+            cache.pin_prefix(list(real_tokens[:boundary]))
+            pinned_hashes.add(prompt_hash)
+            logger.info(
+                f"[pin_system_prompt] system boundary at {boundary} tokens "
+                f"(hash={prompt_hash}) — snapshot will be stored protected"
+            )
+            return boundary
+        except Exception as e:
+            logger.debug(f"[pin_system_prompt] boundary computation failed: {e}")
             return 0
 
     @staticmethod
@@ -2991,6 +3109,14 @@ class BatchedEngine(BaseEngine):
                 )
             if prefix_boundary > 0:
                 kwargs["prefix_boundary"] = prefix_boundary
+
+        # --pin-system-prompt: one request per unique system prompt snapshots
+        # at the system-segment boundary instead, and the cache pins it.
+        pin_boundary = self._maybe_pin_system_boundary(
+            messages, tools, real_prompt=prompt, enable_thinking=enable_thinking
+        )
+        if pin_boundary > 0:
+            kwargs["prefix_boundary"] = pin_boundary
 
         if tools:
             kwargs["has_tools"] = True
